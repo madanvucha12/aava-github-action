@@ -1,0 +1,43 @@
+# Self-test: run this action against itself via a local `uses: ./` reference.
+# Trigger from the Actions tab (or `gh workflow run selftest.yml`) and fill in the inputs.
+# Requires an AAVA_TOKEN repository secret.
+name: AAVA self-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      workflow-id:
+        description: "AAVA workflow id to fire"
+        required: true
+        default: "15654"
+      realm-id:
+        description: "AAVA realm id"
+        required: true
+        default: "185"
+      inputs:
+        description: "Workflow inputs as a JSON object string"
+        required: true
+        default: '{ "brd": "hello from CI self-test" }'
+
+permissions:
+  contents: read
+
+jobs:
+  aava:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run AAVA workflow
+        id: aava
+        uses: ./
+        with:
+          workflow-id: ${{ github.event.inputs.workflow-id }}
+          realm-id: ${{ github.event.inputs.realm-id }}
+          inputs: ${{ github.event.inputs.inputs }}
+          token: ${{ secrets.AAVA_TOKEN }}
+
+      - name: Surface outputs
+        run: |
+          echo "run-id: ${{ steps.aava.outputs.run-id }}"
+          echo "status: ${{ steps.aava.outputs.status }}"
