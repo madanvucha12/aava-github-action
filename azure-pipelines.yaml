@@ -1,0 +1,298 @@
+trigger:
+  branches:
+    include:
+      - development
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: 'GIT-CREDENTIALS'
+  - group: STORAGE_ACC_VARS
+
+  - name: IMAGE_ACR
+    value: aavaacr.azurecr.io
+
+  - name: AZURE_ACR_IMAGE_REPO
+    value: $(acr-repo)
+
+stages:
+
+# ==================================================
+# Stage 1 - Prepare
+# ==================================================
+- stage: Prepare
+  displayName: Prepare Environment
+
+  jobs:
+  - job: Setup
+    displayName: Verify Repository
+
+    steps:
+    - checkout: self
+
+    - script: |
+        echo "Repository checked out successfully"
+      displayName: Verify Repository
+      
+# ==================================================
+# Stage 2 — Checkmarx Scan
+# ==================================================
+- stage: CheckmarxScan
+  displayName: Checkmarx AST Scan
+  dependsOn: Prepare
+
+  jobs:
+  - job: Checkmarx
+    displayName: Run Checkmarx Scan
+
+    steps:
+    - checkout: self
+
+    - task: Checkmarx AST@3
+      displayName: Run Checkmarx SAST + SCA
+      inputs:
+        CheckmarxService: 'cx_scan'
+        projectName: '$(Build.Repository.Name)'
+        branchName: '$(Build.SourceBranchName)'
+        tenantName: 'ascendionava'
+        additionalParams: '--scan-types sast,sca,scs --threshold "sscs-secret-detection-critical=1; sscs-secret-detection-high=1;"'
+
+# ==================================================
+# Stage 2 - Package GitHub Action
+# ==================================================
+- stage: Build
+  displayName: Package GitHub Action
+  dependsOn: CheckmarxScan
+  
+
+  jobs:
+  - job: PackageAction
+    displayName: Package GitHub Action
+
+    steps:
+
+    - checkout: self
+
+    # Extract version from VERSION file
+    - script: |
+        echo "Reading version..."
+
+        VERSION=$(cat ./core/VERSION)
+
+        echo "GitHub Action Version: $VERSION"
+
+        echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$VERSION"
+      displayName: Extract Version
+      name: ExtractVersion
+
+    # Package repository
+    - script: |
+        mkdir -p $(Build.ArtifactStagingDirectory)
+
+        zip -r AAVA-GitHub-Action.zip . \
+          -x ".git/*" \
+             ".DS_Store" \
+             "*.azure-pipelines*" \
+             "*.gitignore"
+
+        mv AAVA-GitHub-Action.zip \
+           $(Build.ArtifactStagingDirectory)
+      displayName: Package GitHub Action
+
+    # Publish artifact
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Build Artifact
+      inputs:
+        PathtoPublish: $(Build.ArtifactStagingDirectory)
+        ArtifactName: github-action
+        publishLocation: Container
+
+# ==================================================
+# Stage 3 - Build Docker Image
+# ==================================================
+- stage: BuildImage
+  displayName: Build and Push Docker Image
+
+  dependsOn: Build
+
+  jobs:
+  - job: DockerBuild
+    displayName: Build Docker Image
+
+    variables:
+      IMAGE_TAG: $[ stageDependencies.Build.PackageAction.outputs['ExtractVersion.IMAGE_TAG'] ]
+
+    steps:
+
+    - checkout: self
+
+    - task: DownloadBuildArtifacts@0
+      displayName: Download Build Artifact
+      inputs:
+        buildType: current
+        downloadType: single
+        artifactName: github-action
+        downloadPath: $(Pipeline.Workspace)
+
+    - script: |
+        cp $(Pipeline.Workspace)/github-action/AAVA-GitHub-Action.zip $(Build.SourcesDirectory)
+
+        ls -lh $(Build.SourcesDirectory)
+      displayName: Prepare Docker Build Context
+
+    - task: Docker@2
+      displayName: Build and Push Docker Image
+      inputs:
+        command: buildAndPush
+        containerRegistry: AAVA-ACR
+        repository: $(AZURE_ACR_IMAGE_REPO)/$(Build.Repository.Name)
+        Dockerfile: $(Build.SourcesDirectory)/Dockerfile
+        buildContext: $(Build.SourcesDirectory)
+        tags: |
+          $(IMAGE_TAG)
+          latest
+    - script: |
+        echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$(IMAGE_TAG)"
+      name: PublishImageTag
+      displayName: Publish IMAGE_TAG
+          
+# ==================================================
+# Stage 5 — Checkmarx Image Scan
+# ==================================================
+- stage: CheckmarxImageScan
+  displayName: Checkmarx Container Security
+  dependsOn: BuildImage
+
+  jobs:
+  - job: ScanImage
+
+    variables:
+      IMAGE_TAG: $[ stageDependencies.BuildImage.DockerBuild.outputs['PublishImageTag.IMAGE_TAG'] ]
+
+    steps:
+    - script: |
+        IMAGE_PATH="$(IMAGE_ACR)/$(AZURE_ACR_IMAGE_REPO)/$(Build.Repository.Name)"
+        IMAGE_PATH_LOWER=$(echo "$IMAGE_PATH" | tr '[:upper:]' '[:lower:]')
+        IMAGE_NAME="${IMAGE_PATH_LOWER}:$(IMAGE_TAG)"
+
+        echo "Scanning Image: $IMAGE_NAME"
+
+        echo "##vso[task.setvariable variable=IMAGE_NAME]$IMAGE_NAME"
+      displayName: Prepare Image Name
+
+    - task: Checkmarx AST@3
+      displayName: Run Checkmarx Container Scan
+      inputs:
+        CheckmarxService: 'cx_scan'
+        projectName: '$(Build.Repository.Name)'
+        branchName: '$(Build.SourceBranchName)'
+        tenantName: 'ascendionava'
+        additionalParams: '--scan-types sast,sca,scs,container-security --containers-file-folder-filter "!**/Dockerfile" --threshold "containers-critical=1; containers-high=1" --container-images $(IMAGE_NAME)'
+    
+# ==================================================
+# Stage 6 — JFrog Xray Scan
+# ==================================================
+- stage: Jfrog
+  displayName: JFrog Xray Scan
+  dependsOn:
+    - CheckmarxImageScan
+    - BuildImage
+
+  jobs:
+  - job: JfrogXrayScan
+    displayName: Run JFrog Xray Container Scan
+
+    variables:
+      IMAGE_TAG: $[ stageDependencies.BuildImage.DockerBuild.outputs['PublishImageTag.IMAGE_TAG'] ]
+
+    steps:
+    - task: Docker@2
+      displayName: Login to Azure Container Registry
+      inputs:
+        containerRegistry: 'AAVA-ACR'
+        command: login
+
+    - script: |
+        echo "=============== CLEANING DISK SPACE ==============="
+        docker system prune -af || true
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+      displayName: Free Disk Space Before Scan
+
+    - script: |
+        export TMPDIR=/home/vsts/work/_temp
+
+        IMAGE_PATH="$(IMAGE_ACR)/$(AZURE_ACR_IMAGE_REPO)/$(Build.Repository.Name)"
+        IMAGE_PATH_LOWER=$(echo "$IMAGE_PATH" | tr '[:upper:]' '[:lower:]')
+        IMAGE_NAME="${IMAGE_PATH_LOWER}:$(IMAGE_TAG)"
+
+        echo "Image to scan: $IMAGE_NAME"
+
+        docker pull "$IMAGE_NAME"
+
+        curl -fL https://install-cli.jfrog.io | sh
+
+        jf config add myjfrog \
+          --url https://ascendionaava.jfrog.io \
+          --user "$(JFROG_USERNAME)" \
+          --access-token "$(JFROG_ACCESS_TOKEN)" \
+          --interactive=false
+
+        jf docker scan "$IMAGE_NAME" --server-id=myjfrog --fail=false
+      displayName: Run JFrog Xray Container Scan
+
+# ==================================================
+# Stage 4 - Upload GitHub Action to Blob Storage
+# ==================================================
+- stage: UploadPlugin
+  displayName: Upload GitHub Action to Blob Storage
+
+  dependsOn:
+    - Jfrog
+    - BuildImage
+
+  jobs:
+  - job: Upload
+    displayName: Upload GitHub Action
+
+    variables:
+      IMAGE_TAG: $[ stageDependencies.BuildImage.DockerBuild.outputs['PublishImageTag.IMAGE_TAG'] ]
+
+    steps:
+
+    - task: DownloadBuildArtifacts@0
+      displayName: Download Build Artifact
+      inputs:
+        buildType: current
+        downloadType: single
+        artifactName: github-action
+        downloadPath: $(Pipeline.Workspace)
+
+    - script: |
+        ZIP_FILE=$(find $(Pipeline.Workspace) -name "AAVA-GitHub-Action.zip" | head -n 1)
+
+        if [ -z "$ZIP_FILE" ]; then
+          echo "AAVA-GitHub-Action.zip not found."
+          exit 1
+        fi
+
+        ZIP_NAME="AAVA-GitHub-Action-$(IMAGE_TAG).zip"
+
+        mkdir -p package
+
+        cp "$ZIP_FILE" "package/$ZIP_NAME"
+
+        echo "Uploading $ZIP_NAME to Azure Blob Storage"
+
+        az storage blob upload \
+          --connection-string "$(storage_account_connecting_string)" \
+          --container-name "$(container_name)" \
+          --file "package/$ZIP_NAME" \
+          --name "${IMAGE_TAG}/$ZIP_NAME" \
+          --overwrite true
+
+        echo "Upload completed successfully."
+      displayName: Upload GitHub Action

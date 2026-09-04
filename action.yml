@@ -1,0 +1,117 @@
+name: "AAVA Workflow"
+description: "Run an AAVA workflow with inputs and report the result. Fails the step if the workflow fails — use it as a required PR check."
+author: "Ascendion AAVA Professional Services"
+branding:
+  icon: "play-circle"
+  color: "green"
+
+inputs:
+  workflow-id:
+    description: "AAVA workflow (pipeline) id to run."
+    required: true
+  inputs:
+    description: "Workflow inputs as a JSON object string."
+    required: true
+  token:
+    description: "AAVA access token (JWT). Pass via a repository secret, never inline."
+    required: true
+  base-url:
+    description: "AAVA API base URL."
+    required: false
+    default: "https://int-ai.aava.ai"
+  timeout:
+    description: "Max seconds to wait for the workflow to finish."
+    required: false
+    default: "900"
+  comment-on-pr:
+    description: "Post the result as a comment on the PR (pull_request events only; uses GITHUB_TOKEN)."
+    required: false
+    default: "false"
+
+outputs:
+  run-id:
+    description: "AAVA run id."
+    value: "${{ steps.aava.outputs.run-id }}"
+  status:
+    description: "COMPLETED | FAILED | TIMEOUT."
+    value: "${{ steps.aava.outputs.status }}"
+  result:
+    description: "Full aava-exec --json payload (run_id, workflow_id, status, result)."
+    value: "${{ steps.aava.outputs.result }}"
+
+runs:
+  using: "composite"
+  steps:
+    - id: aava
+      shell: bash
+      # All caller values are passed via env (never interpolated into the script) — injection-safe.
+      env:
+        AAVA_TOKEN: "${{ inputs.token }}"
+        AAVA_BASE_URL: "${{ inputs.base-url }}"
+        AAVA_WORKFLOW_ID: "${{ inputs.workflow-id }}"
+        AAVA_INPUTS: "${{ inputs.inputs }}"
+        AAVA_TIMEOUT: "${{ inputs.timeout }}"
+        AAVA_COMMENT_ON_PR: "${{ inputs.comment-on-pr }}"
+        AAVA_CORE_ROOT: "${{ github.action_path }}/core"
+        AAVA_DATA_DIR: "${{ runner.temp }}/aava"
+        GH_TOKEN: "${{ github.token }}"
+      run: |
+        set -uo pipefail
+        mkdir -p "$AAVA_DATA_DIR"
+        printf '%s' "$AAVA_INPUTS" > "${RUNNER_TEMP:-/tmp}/aava-inputs.json"
+
+        # Fire + poll. --json -> stdout (parsed); progress -> stderr (job log).
+        set +e
+        out=$(python3 "$AAVA_CORE_ROOT/bin/aava-exec" \
+                --workflow "$AAVA_WORKFLOW_ID" \
+                --inputs "${RUNNER_TEMP:-/tmp}/aava-inputs.json" \
+                --timeout "$AAVA_TIMEOUT" \
+                --json)
+        code=$?
+        set -e
+
+        run_id=""
+        wf_status=""
+        if [ -n "$out" ]; then
+          run_id=$(printf '%s' "$out" | python3 -c 'import sys,json;print((json.load(sys.stdin) or {}).get("run_id",""))' 2>/dev/null || true)
+          wf_status=$(printf '%s' "$out" | python3 -c 'import sys,json;print((json.load(sys.stdin) or {}).get("status",""))' 2>/dev/null || true)
+        fi
+        if [ -z "$wf_status" ]; then
+          case "$code" in
+            0) wf_status="COMPLETED" ;;
+            3) wf_status="TIMEOUT" ;;
+            *) wf_status="FAILED" ;;
+          esac
+        fi
+
+        # Step outputs (multiline result via heredoc delimiter)
+        {
+          echo "run-id=$run_id"
+          echo "status=$wf_status"
+          echo "result<<AAVA_JSON_EOF"
+          printf '%s\n' "${out:-{}}"
+          echo "AAVA_JSON_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+        # Run-page summary
+        {
+          echo "### AAVA workflow \`$AAVA_WORKFLOW_ID\`"
+          echo ""
+          echo "| field | value |"
+          echo "|---|---|"
+          echo "| run | \`${run_id:-n/a}\` |"
+          echo "| status | **$wf_status** |"
+          echo "| exit code | $code |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        # Optional PR comment
+        if [ "$AAVA_COMMENT_ON_PR" = "true" ] && [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
+          pr=$(jq -r '.pull_request.number // empty' "${GITHUB_EVENT_PATH:-/dev/null}" 2>/dev/null || true)
+          if [ -n "$pr" ]; then
+            gh pr comment "$pr" --body "AAVA workflow \`$AAVA_WORKFLOW_ID\` → **$wf_status** (run \`${run_id:-n/a}\`)" \
+              || echo "::warning::AAVA: could not post PR comment"
+          fi
+        fi
+
+        echo "AAVA: workflow $AAVA_WORKFLOW_ID -> $wf_status (run ${run_id:-n/a}, exit $code)"
+        exit $code

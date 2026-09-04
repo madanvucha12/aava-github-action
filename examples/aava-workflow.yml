@@ -1,0 +1,35 @@
+# Example: run an AAVA workflow on PRs and gate the merge on it.
+# Copy into a consuming repo at .github/workflows/aava.yml and set the AAVA_TOKEN secret.
+name: AAVA
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      workflow-id:
+        description: "AAVA workflow id"
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write   # only needed if comment-on-pr is true
+
+jobs:
+  aava:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run AAVA workflow
+        id: aava
+        uses: ascendionava/aava-github-action@v1
+        with:
+          workflow-id: ${{ github.event.inputs.workflow-id || '15654' }}
+          realm-id: "185"
+          inputs: |
+            { "source_ref": "${{ github.sha }}", "title": "${{ github.event.pull_request.title }}" }
+          token: ${{ secrets.AAVA_TOKEN }}
+          comment-on-pr: "true"
+
+      - name: Surface outputs
+        run: |
+          echo "run-id: ${{ steps.aava.outputs.run-id }}"
+          echo "status: ${{ steps.aava.outputs.status }}"

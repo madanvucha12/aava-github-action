@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Execute an AAVA workflow with inputs. Fire-and-poll, dual-status check.
+
+Usage:
+  aava-exec --workflow 15654 --inputs path/to/inputs.json
+  aava-exec --workflow 15654 --inputs '{"brd": "..."}'   # inline JSON
+  aava-exec --replay <run-id>                            # re-execute with cached inputs
+  aava-exec --workflow 15654 --inputs ... --no-wait      # fire, don't poll
+  aava-exec --workflow 15654 --inputs ... --json         # machine-readable
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+
+def main() -> int:
+    root = os.environ.get("AAVA_CORE_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, root)
+    from lib.transport import get_transport, TransportError
+    from lib.runs import Runs
+
+    p = argparse.ArgumentParser(description="Execute an AAVA workflow.")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--workflow", help="Workflow ID to fire")
+    src.add_argument("--replay", help="Run ID to replay (reads cached inputs)")
+    p.add_argument("--inputs", help="Inputs as JSON file path or inline JSON string")
+    p.add_argument("--no-wait", action="store_true", help="Fire and exit without polling")
+    p.add_argument("--poll-interval", type=int, default=5, help="Seconds between polls (default 5)")
+    p.add_argument("--timeout", type=int, default=900, help="Max wait in seconds (default 900)")
+    p.add_argument("--json", action="store_true", help="Emit JSON (machine-readable)")
+    args = p.parse_args()
+
+    try:
+        transport = get_transport()
+    except TransportError as e:
+        print(f"[exec] FAIL: {e}", file=sys.stderr)
+        return 1
+
+    runs = Runs()
+
+    # Resolve workflow + inputs
+    if args.replay:
+        meta = runs.get_metadata(args.replay)
+        inputs = runs.get_inputs(args.replay)
+        if not meta or inputs is None:
+            print(f"[exec] no cached run {args.replay}", file=sys.stderr)
+            return 1
+        workflow_id = meta["workflow_id"]
+        print(f"[exec] replaying run {args.replay}: workflow {workflow_id}, {len(inputs)} input vars", file=sys.stderr)
+    else:
+        workflow_id = args.workflow
+        if not args.inputs:
+            print("[exec] --inputs required (file path or inline JSON)", file=sys.stderr)
+            return 1
+        if args.inputs.startswith("{") or args.inputs.startswith("["):
+            inputs = json.loads(args.inputs)
+        else:
+            inputs = json.loads(Path(args.inputs).read_text(encoding="utf-8"))
+
+    # Fire
+    try:
+        resp = transport.execute_workflow(workflow_id, inputs)
+    except Exception as e:
+        print(f"[exec] FAIL on execute_workflow: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+
+    # AAVA's execute response shape varies by endpoint version. The execution id can
+    # land at any of these keys; walk them all before giving up.
+    def _find_exec_id(obj):
+        if not isinstance(obj, dict):
+            return None
+        for k in ("executionId", "runId", "workflowExecutionId", "workflow_execution_id", "id"):
+            v = obj.get(k)
+            if v not in (None, "", 0):
+                return v
+        # Nested under data / executionDetails / result
+        for nest_key in ("data", "executionDetails", "result"):
+            nested = obj.get(nest_key)
+            v = _find_exec_id(nested)
+            if v:
+                return v
+        return None
+
+    run_id = _find_exec_id(resp)
+    if not run_id:
+        print(f"[exec] no execution ID in response: {json.dumps(resp)[:300]}", file=sys.stderr)
+        return 2
+
+    runs.save_metadata(str(run_id),
+                        workflow_id=str(workflow_id),
+                        scope_key=transport.scope_key,
+                        inputs=inputs,
+                        status="STARTED")
+
+    print(f"[exec] fired: workflow {workflow_id} → run {run_id}", file=sys.stderr)
+
+    if args.no_wait:
+        if args.json:
+            print(json.dumps({"run_id": str(run_id), "workflow_id": str(workflow_id), "status": "STARTED"}))
+        return 0
+
+    # Poll loop with dual-status check
+    deadline = time.time() + args.timeout
+    final = None
+    while time.time() < deadline:
+        time.sleep(args.poll_interval)
+        try:
+            poll = transport.poll_run(str(run_id))
+        except Exception as e:
+            print(f"[exec] poll error: {e}", file=sys.stderr)
+            continue
+        top = poll.get("status")
+        inner = (poll.get("data") or {}).get("status")
+        print(f"  [{int(time.time())}] top={top} inner={inner}", file=sys.stderr)
+        if top in ("FAILURE", "FAILED") or (inner and inner.upper() in ("FAILED", "FAILURE", "ERROR")):
+            final = poll
+            runs.update_metadata(str(run_id), status="FAILED")
+            break
+        if top == "SUCCESS" and inner != "IN_PROGRESS":
+            final = poll
+            runs.update_metadata(str(run_id), status="COMPLETED")
+            runs.save_output(str(run_id), poll.get("data") or poll)
+            break
+    else:
+        runs.update_metadata(str(run_id), status="TIMEOUT")
+        print(f"[exec] timeout after {args.timeout}s", file=sys.stderr)
+        return 3
+
+    status = "COMPLETED" if final and final.get("status") == "SUCCESS" else "FAILED"
+    print(f"[exec] {status}: run {run_id}", file=sys.stderr)
+
+    if args.json:
+        print(json.dumps({"run_id": str(run_id), "workflow_id": str(workflow_id),
+                          "status": status, "result": final}, indent=2, default=str))
+    return 0 if status == "COMPLETED" else 4
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
